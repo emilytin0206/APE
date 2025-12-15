@@ -4,6 +4,8 @@ import os
 import time
 from tqdm import tqdm
 from abc import ABC, abstractmethod
+import requests
+import json
 
 import openai
 
@@ -22,6 +24,9 @@ def model_from_config(config, disable_tqdm=True):
         return GPT_Forward(config, disable_tqdm=disable_tqdm)
     elif model_type == "GPT_insert":
         return GPT_Insert(config, disable_tqdm=disable_tqdm)
+    elif model_type == "Ollama_Forward":
+        # 新增識別 Ollama_Forward
+        return Ollama_Forward(config, disable_tqdm=disable_tqdm)
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -49,6 +54,105 @@ class LLM(ABC):
             A list of log probs.
         """
         pass
+
+
+class Ollama_Forward(LLM):
+    """Wrapper for Ollama API."""
+
+    def __init__(self, config, needs_confirmation=False, disable_tqdm=True):
+        """Initializes the model."""
+        self.config = config
+        self.needs_confirmation = needs_confirmation
+        self.disable_tqdm = disable_tqdm
+
+    def generate_text(self, prompt, n):
+        if not isinstance(prompt, list):
+            prompt = [prompt]
+        
+        # Ollama 通常是本地運行且免費，所以我們可以跳過嚴格的費用確認
+        if self.needs_confirmation and os.getenv("LLM_SKIP_CONFIRM") is None:
+            print(f"[{self.config['name']}] Requesting {len(prompt) * n} completions from Ollama.")
+            confirm = input("Continue? (y/n) ")
+            if confirm != 'y':
+                raise Exception("Aborted.")
+
+        batch_size = self.config.get('batch_size', 1)
+        prompt_batches = [prompt[i:i + batch_size]
+                          for i in range(0, len(prompt), batch_size)]
+        
+        if not self.disable_tqdm:
+            print(
+                f"[{self.config['name']}] Generating {len(prompt) * n} completions, "
+                f"split into {len(prompt_batches)} batches of size {batch_size * n}")
+        
+        text = []
+        for prompt_batch in tqdm(prompt_batches, disable=self.disable_tqdm):
+            text += self.__generate_text(prompt_batch, n)
+        return text
+
+    def __generate_text(self, prompt, n):
+        """Generates text from the model using Ollama API."""
+        api_url = self.config.get('api_url')
+        if not api_url:
+            raise ValueError("api_url is required for Ollama_Forward")
+
+        gpt_config = self.config.get('gpt_config', {})
+        model = gpt_config.get('model')
+        temperature = gpt_config.get('temperature', 0.7)
+        max_tokens = gpt_config.get('max_tokens', 256)
+        top_p = gpt_config.get('top_p', 0.9)
+
+        # 預處理 Prompt: 移除 [APE] 標記，因為這不是實際 Prompt 的一部分
+        processed_prompts = [p.replace('[APE]', '').strip() for p in prompt]
+        
+        results = []
+        
+        # Ollama API 通常一次處理一個請求 (或是對話歷史)，我們這裡逐一處理 batch
+        for p_text in processed_prompts:
+            # 針對每個 Prompt 生成 n 個回應
+            for _ in range(n):
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": p_text}],
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens, # Ollama 使用 num_predict 控制輸出長度
+                        "top_p": top_p
+                    }
+                }
+                
+                response_text = None
+                while response_text is None:
+                    try:
+                        response = requests.post(api_url, json=payload)
+                        response.raise_for_status()
+                        data = response.json()
+                        
+                        # 處理 /api/chat 的回應格式
+                        if 'message' in data:
+                            response_text = data['message']['content']
+                        # 處理 /api/generate 的回應格式 (作為備案)
+                        elif 'response' in data:
+                            response_text = data['response']
+                        else:
+                            print(f"Unexpected response format from Ollama: {data.keys()}")
+                            response_text = ""
+                            
+                    except Exception as e:
+                        print(f"Ollama connection error: {e}")
+                        print('Retrying...')
+                        time.sleep(2)
+                
+                results.append(response_text)
+
+        return results
+
+    def log_probs(self, text, log_prob_range=None):
+        # Ollama API 目前對 logprobs 的支援較複雜且非標準，
+        # 對於 exec_accuracy (執行準確率) 的評估來說，不需要 log_probs。
+        # 如果使用 likelihood 評估方法，這裡需要另外實作。
+        raise NotImplementedError("Ollama_Forward does not currently support log_probs.")
 
 
 class GPT_Forward(LLM):
@@ -330,24 +434,43 @@ class GPT_Insert(LLM):
 
 def gpt_get_estimated_cost(config, prompt, max_tokens):
     """Uses the current API costs/1000 tokens to estimate the cost of generating text from the model."""
+    # Ollama 本地運行通常免費
+    if config.get('name') == 'Ollama_Forward':
+        return 0.0
+
     # Get rid of [APE] token
     prompt = prompt.replace('[APE]', '')
     # Get the number of tokens in the prompt
     n_prompt_tokens = len(prompt) // 4
     # Get the number of tokens in the generated text
     total_tokens = n_prompt_tokens + max_tokens
-    engine = config['gpt_config']['model'].split('-')[1]
+    
+    model_name = config['gpt_config']['model']
     costs_per_thousand = gpt_costs_per_thousand
+    
+    # 增加穩定性：如果模型名稱沒有 '-' (如 qwen2.5:14b)，則使用默認定價或嘗試解析
+    engine = None
+    if '-' in model_name:
+        parts = model_name.split('-')
+        if len(parts) > 1:
+            engine = parts[1]
+    
+    # If the model name doesn't follow the 'text-engine-001' format or engine not found
     if engine not in costs_per_thousand:
-        # Try as if it is a fine-tuned model
-        engine = config['gpt_config']['model'].split(':')[0]
+        # Fallback logic for fine-tuned or unknown models
+        try:
+            engine = model_name.split(':')[0]
+        except:
+            engine = 'davinci' # Default fallback
+            
         costs_per_thousand = {
             'davinci': 0.1200,
             'curie': 0.0120,
             'babbage': 0.0024,
             'ada': 0.0016
         }
-    price = costs_per_thousand[engine] * total_tokens / 1000
+        
+    price = costs_per_thousand.get(engine, 0.1200) * total_tokens / 1000
     return price
 
 

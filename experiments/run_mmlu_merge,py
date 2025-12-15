@@ -1,0 +1,108 @@
+# 檔案位置: experiments/run_mmlu_merged.py
+import fire
+from automatic_prompt_engineer import ape, data
+
+# 引用我們自定義的模組
+from experiments.data.mmlu.load_merged_data import load_merged_data
+from experiments.evaluation.mmlu.mmlu_eval import mmlu_accuracy_evaluator
+
+def run(samples_per_task=300, train_ratio=0.8):
+    # 1. 載入合併後的資料
+    # induce_data: 用來生成 Prompt 與 Bandit 搜尋
+    # test_data:  最後用來評估選出來的 Prompt 效果
+    induce_data, test_data = load_merged_data(samples_per_task=samples_per_task, train_ratio=train_ratio)
+
+    # 2. 進一步準備 APE 內部需要的資料切分
+    # 從 induce_data 中，切出一小部分 (prompt_gen_data) 用來「反推 Prompt」
+    # 剩下的部分 (eval_data) 用來在搜尋過程中計算分數
+    prompt_gen_size = 50 # 可以設定固定數量，例如 50 筆
+    prompt_gen_data, eval_data = data.create_split(induce_data, prompt_gen_size)
+
+    # 3. 定義 Templates
+    # 這是給模型看的題目格式
+    eval_template = "Instruction: [PROMPT]\n\n[full_DEMO]\n\nQuestion:\n[INPUT]\nAnswer: [OUTPUT]"
+    
+    # 這是用來讓模型反推指令的 Template
+    prompt_gen_template = "I gave a student an instruction. Based on the instruction they answered the following multiple-choice questions:\n\n[full_DEMO]\n\nThe instruction was to [APE]"
+    
+    demos_template = "Question:\n[INPUT]\nAnswer: [OUTPUT]"
+
+    # 4. 設定 APE 參數
+    base_config = 'experiments/configs/instruction_induction.yaml'
+    conf = {
+        'generation': {
+            'num_subsamples': 3,            # 採樣幾組資料來生成 Prompt
+            'num_demos': 3,                 # 每組 Few-shot 的範例數
+            'num_prompts_per_subsample': 10, # 每組生成幾個候選 Prompt
+            'model': {
+                'gpt_config': {
+                    'model': 'gpt-3.5-turbo-instruct' 
+                }
+            }
+        },
+        'evaluation': {
+            'method': mmlu_accuracy_evaluator, # 使用包含 metrics 清洗邏輯的評估器
+            'num_few_shot': 0,               # 評估時使用 Zero-shot
+            'num_samples': 50,               # 搜尋階段每次評估取 50 筆 (省錢/省時)
+            'model': {
+                'gpt_config': {
+                     'model': 'gpt-3.5-turbo-instruct',
+                     'max_tokens': 10
+                }
+            }
+        }
+    }
+
+    print("-" * 30)
+    print("開始執行 APE (Automatic Prompt Engineer)...")
+    
+    # 5. 執行搜尋 (Find Prompts)
+    res, demo_fn = ape.find_prompts(
+        eval_template=eval_template,
+        prompt_gen_data=prompt_gen_data,
+        eval_data=eval_data,
+        conf=conf,
+        base_conf=base_config,
+        few_shot_data=induce_data, # 用於填充 Few-shot 範例
+        demos_template=demos_template,
+        prompt_gen_template=prompt_gen_template
+    )
+
+    print('搜尋完成。')
+    prompts, scores = res.sorted()
+    
+    print('最佳 Prompts (在訓練集上的表現):')
+    for prompt, score in list(zip(prompts, scores))[:5]:
+        print(f'  Score {score:.2f}: {prompt}')
+
+    # 6. 最後使用保留的 Test Set (20%) 進行最終評估
+    print("-" * 30)
+    print(f"使用測試集 ({len(test_data[0])} 筆) 評估最佳 Prompt...")
+    
+    # 設定測試階段的參數 (通常會測更多筆資料以求精確)
+    test_conf = conf.copy()
+    test_conf['evaluation']['num_samples'] = len(test_data[0]) # 測所有測試集
+    
+    # 評估第一名的 Prompt
+    best_prompt = prompts[0]
+    test_res = ape.evaluate_prompts(
+        prompts=[best_prompt],
+        eval_template=eval_template,
+        eval_data=test_data,
+        few_shot_data=induce_data,
+        demos_template=demos_template,
+        conf=test_conf,
+        base_conf=base_config
+    )
+    
+    test_score = test_res.sorted()[1][0]
+    print(f'>>> 最終測試集分數: {test_score:.2f}')
+    print(f'>>> 最佳 Prompt: {best_prompt}')
+
+    # 存檔
+    with open('experiments/results_mmlu_merged.txt', 'w') as f:
+        f.write(f'Final Test Score: {test_score:.2f}\n')
+        f.write(f'Best Prompt: {best_prompt}\n')
+
+if __name__ == '__main__':
+    fire.Fire(run)
