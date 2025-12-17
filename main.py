@@ -6,9 +6,10 @@ import random
 from ape.llm import LLM
 from ape.generate import generate_prompts
 from ape.evaluator import exec_accuracy_evaluator
-from data.mmlu import load_merged_mmlu_data  # 改用新的合併函數
+from data.mmlu import load_merged_mmlu_data
 
 def save_experiment_results(config, task_name, results):
+    # (保持原樣，省略以節省篇幅)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     target_model_safe = config['target']['model'].replace(':', '-')
     optimizer_model_safe = config['optimizer']['model'].replace(':', '-')
@@ -43,8 +44,8 @@ def main():
     # --- Configuration ---
     OLLAMA_URL = "http://140.113.86.14:11434/api/chat"
     
-    # 定義要合併訓練的 5 個 MMLU 子集
-    TRAIN_SUBSETS = [
+    # 1. 定義所有要參與實驗的子集
+    ALL_SUBSETS = [
         "high_school_mathematics",
         "high_school_world_history",
         "high_school_physics",
@@ -52,14 +53,14 @@ def main():
         "business_ethics"
     ]
     
-    # 測試集 (通常選其中一個或全部，這裡以 high_school_mathematics 為例進行主要評測)
-    TEST_TASK = "high_school_mathematics" 
+    # 定義實驗標籤名稱
+    TASK_LABEL = f"merged_{len(ALL_SUBSETS)}_subsets"
 
     conf = {
         'optimizer': {
             'model': 'qwen2.5:32b',
             'api_url': OLLAMA_URL,
-            'temperature': 0.9 # 稍微調高溫度以增加生成多樣性
+            'temperature': 0.7 # 稍微調高溫度以增加生成多樣性
         },
         'target': {
             'model': 'qwen2.5:7b',
@@ -68,62 +69,91 @@ def main():
         },
         'generation': {
             # === 官方 3 次迭代設定 ===
-            'num_subsamples': 3,             # 迭代 3 次 (3 組不同的 Context)
-            'num_prompts_per_subsample': 10, # 每次生成 10 個 (總共 30 個候選)
-            'num_demos': 3,
+            'num_subsamples': 5,            
+            'num_prompts_per_subsample': 50, # 每次生成 n 個 
+            'num_demos': 5,
             'prompt_gen_template': "I gave a friend an instruction. Based on the instruction they produced the following input-output pairs:\n\n[full_DEMO]\n\nThe instruction was to [APE]",
             'demos_template': "Input: [INPUT]\nOutput: [OUTPUT]"
         },
         'evaluation': {
-            'num_samples': 20,
+            'num_samples': 50,
             'num_few_shot': 0,
             'eval_template': "Instruction: [PROMPT]\n\n[INPUT] [OUTPUT]",
             'demos_template': "Input: [INPUT]\nOutput: [OUTPUT]"
         }
     }
-
-    # 1. Load Data (Merging 5 subsets for Training)
-    # 限制每個子集只載入 50 筆，避免訓練資料過大 (總共 250 筆)
-    inputs, outputs = load_merged_mmlu_data(TRAIN_SUBSETS, limit_per_subset=50)
+# --- Step 1: Data Loading & Pooling ---
+    print(f"\n[Data] Loading and merging {len(ALL_SUBSETS)} subsets...")
     
-    if not inputs:
-        print("Error loading data.")
+    # 這裡我們一次讀取所有子集，限制每個子集讀取量 (例如各 100 筆，總共 500 筆)
+    # 這樣可以確保數據集不會過大，但包含所有領域
+    raw_inputs, raw_outputs = load_merged_mmlu_data(ALL_SUBSETS, split='test', limit_per_subset=100)
+    
+    if not raw_inputs:
+        print("[Error] No data loaded.")
         return
 
-    # 將所有數據作為訓練數據 (Generation Data)
-    train_data = (inputs, outputs)
+    # --- Step 2: Shuffling & Strict Splitting ---
+    print("[Data] Shuffling and splitting data...")
+    
+    # 將 input/output 配對後一起洗牌，確保對應關係不變
+    paired_data = list(zip(raw_inputs, raw_outputs))
+    random.seed(42) # 固定種子，確保實驗可重現
+    random.shuffle(paired_data)
+    
+    # 解開配對
+    shuffled_inputs, shuffled_outputs = zip(*paired_data)
+    shuffled_inputs = list(shuffled_inputs)
+    shuffled_outputs = list(shuffled_outputs)
 
-    # 載入專門的測試數據 (Evaluation Data)
-    # 這裡我們重新載入一次 TEST_TASK 作為評估基準
-    test_inputs, test_outputs = load_merged_mmlu_data([TEST_TASK], split='test', limit_per_subset=100)
-    eval_data = (test_inputs, test_outputs)
+    # 定義切分點 (Split Point)
+    # 例如：拿前 50 筆做 APE 的訓練 (生成 Prompt)，剩下的做測試
+    TRAIN_SIZE = 50 
+    
+    # Strict Split: 
+    # train_data 用於 generate_prompts (含 demos)
+    train_data = (shuffled_inputs[:TRAIN_SIZE], shuffled_outputs[:TRAIN_SIZE])
+    
+    # eval_data 用於 evaluator (計算分數)
+    eval_data = (shuffled_inputs[TRAIN_SIZE:], shuffled_outputs[TRAIN_SIZE:])
 
-    # 2. Generate Prompts (Optimizer)
+    print(f"  - Total Data Pool: {len(shuffled_inputs)}")
+    print(f"  - Train Set (Generation Demos): {len(train_data[0])} samples (Indices 0-{TRAIN_SIZE})")
+    print(f"  - Test Set (Evaluation): {len(eval_data[0])} samples (Indices {TRAIN_SIZE}-end)")
+    
+    # --- Step 3: Generate Prompts ---
+    print("\n[APE] Step 1: Generating Prompts...")
     optimizer_model = LLM(conf['optimizer'])
+    
+    # 注意：這裡只傳入 train_data。generate_prompts 內部的 random.sample 
+    # 只會從這 50 筆中挑選，絕對不會碰到 eval_data。
     candidates = generate_prompts(optimizer_model, train_data, conf['generation'])
     
-    print(f"\nGenerated {len(candidates)} candidates.")
-    
+    print(f"Generated {len(candidates)} candidates.")
     if not candidates:
-        print("No candidates generated.")
         return
 
-    # 3. Evaluate Prompts (Target)
+    # --- Step 4: Evaluate Prompts ---
+    print("\n[APE] Step 2: Evaluating Prompts...")
     target_model = LLM(conf['target'])
+    
+    # 注意：這裡傳入 eval_data 作為測試題庫。
+    # 如果 evaluator 需要 few-shot examples (目前 num_few_shot=0)，
+    # 我們傳入 train_data 作為 "few_shot_data" 的來源，確保不在 Test Set 裡面偷看答案。
     scored_results = exec_accuracy_evaluator(
-        target_model, 
-        candidates, 
-        eval_data,     # 在測試集上評估
-        train_data,    # 如果需要 Few-shot，從訓練集取樣
-        conf['evaluation']
+        model=target_model, 
+        prompts=candidates, 
+        eval_data=eval_data,     # 用 Test Set 考試
+        few_shot_data=train_data,# 用 Train Set 當作範例 (如果有開 Few-shot)
+        config=conf['evaluation']
     )
 
-    # 4. Show & Save Results
+    # --- Step 5: Save ---
     print("\n=== Final Leaderboard ===")
     for rank, (prompt, score) in enumerate(scored_results[:5]):
         print(f"Rank {rank+1} | Score: {score:.2f} | Prompt: {prompt}")
 
-    save_experiment_results(conf, "merged_5_tasks", scored_results)
+    save_experiment_results(conf, TASK_LABEL, scored_results)
 
 if __name__ == "__main__":
     main()
