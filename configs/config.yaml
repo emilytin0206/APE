@@ -1,5 +1,3 @@
-# configs/config.yaml
-
 api:
   optimizer_url: "http://140.113.86.14:11434/api/chat"
   optimizer_model: "qwen2.5:32b"
