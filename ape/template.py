@@ -1,5 +1,3 @@
-from ape.template import EvalTemplate, DemosTemplate, GenerationTemplate
-
 class GenerationTemplate:
     """
     [Official Implementation]
