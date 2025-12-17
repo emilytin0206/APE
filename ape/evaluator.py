@@ -2,32 +2,33 @@
 import random
 import numpy as np
 from typing import List, Tuple, Dict, Any
-from . import llm, utility  # 假設 utility 在同目錄
+from . import utility 
 
+# [Fix 1] 修改函式簽章，接收 model 並移除不需要的 template 物件參數
 def exec_accuracy_evaluator(
+    model, 
     prompts: List[str],
-    eval_template: Any,  # 傳入 EvalTemplate 物件
     eval_data: Tuple[List[str], List[List[str]]],
-    demos_template: Any, # 傳入 DemosTemplate 物件
     few_shot_data: Tuple[List[str], List[List[str]]],
     config: Dict[str, Any]
 ) -> List[Tuple[str, float]]:
     """
-    仿照官方風格的評估器，但使用 Execution Accuracy (Exact Match) 作為評分標準。
+    Evaluates prompts using Execution Accuracy (Exact Match).
+    Adaptation: Accepts model instance directly and handles string templates.
     """
-    
-    # 1. 從 Config 實例化模型 (使用官方 llm.py 的工廠模式)
-    # Config 結構需包含 ['model']
-    model = llm.model_from_config(config['model'])
     
     # 讀取參數
     num_samples = config.get('num_samples', 20)
     num_few_shot = config.get('num_few_shot', 0)
     
-    # 2. 準備數據採樣 (Subsampling)
+    # [Fix 2] 直接從 config 讀取字串模板 (配合 main.py 的設定)
+    eval_template = config.get('eval_template', "Instruction: [PROMPT]\n\n[INPUT]\n[OUTPUT]")
+    demos_template = config.get('demos_template', "Input: [INPUT]\nOutput: [OUTPUT]")
+    
+    # 準備數據採樣 (Subsampling)
     inputs, outputs = eval_data
     indices = list(range(len(inputs)))
-    # 簡單隨機採樣，或者你可以保留原本固定的 indices[:num_samples]
+    # 確保不會 index out of range
     sample_indices = indices[:min(num_samples, len(indices))]
     
     queries = []
@@ -35,52 +36,73 @@ def exec_accuracy_evaluator(
     
     print(f"Generating queries for {len(prompts)} prompts over {len(sample_indices)} samples...")
 
-    # 3. 構建查詢 (使用 Template 物件)
+    # 構建查詢
     for prompt in prompts:
         for idx in sample_indices:
             inp = inputs[idx]
-            out = outputs[idx]
+            out = outputs[idx] # 這是標準答案 list
             
             # 準備 Few-shot 範例
+            full_demo = ""
             if num_few_shot > 0 and few_shot_data:
                 # 隨機抽取 demo
                 fs_indices = random.sample(range(len(few_shot_data[0])), min(num_few_shot, len(few_shot_data[0])))
-                fs_inputs = [few_shot_data[0][i] for i in fs_indices]
-                fs_outputs = [few_shot_data[1][i] for i in fs_indices]
                 
-                # 使用 DemosTemplate 填空
-                full_demo = demos_template.fill((fs_inputs, fs_outputs))
-            else:
-                full_demo = ""
+                demo_strs = []
+                for i in fs_indices:
+                    # [Fix 3] 使用 replace 處理字串模板
+                    d = demos_template.replace('[INPUT]', few_shot_data[0][i])\
+                                      .replace('[OUTPUT]', few_shot_data[1][i][0])
+                    demo_strs.append(d)
+                full_demo = "\n\n".join(demo_strs)
 
-            # 使用 EvalTemplate 填空
-            # 注意：這裡 output 留空，讓模型生成
-            query = eval_template.fill(prompt=prompt, input=inp, full_demo=full_demo, output="")
+            # [Fix 3] 使用 replace 處理 Eval 模板
+            # 邏輯：先把 prompt 放進去，再放 demo，最後放 input
+            # 注意：這裡的 replace 順序需依照您的模板結構微調，這裡假設標準 APE 格式
+            query = eval_template.replace('[PROMPT]', prompt)\
+                                 .replace('[INPUT]', inp)\
+                                 .replace('[OUTPUT]', "") # 留空給模型填
+            
+            # 如果有 demo，通常 eval_template 裡沒有 [full_demo] 佔位符
+            # 這裡簡單地將 demo 接在 query 前面 (若模板沒特殊設計)
+            if full_demo:
+                query = f"{full_demo}\n\n{query}"
             
             queries.append(query)
             ground_truths.append(out)
 
-    # 4. 執行生成 (Batch Generation)
-    # 注意：這裡呼叫的是官方 llm.py 的 generate_text，需要 n=1
-    print(f"Querying LLM...")
-    predictions = model.generate_text(queries, n=1)
+    # 執行生成 (Batch Generation)
+    print(f"Querying LLM (Total {len(queries)} requests)...")
     
-    # 官方 generate_text 有時回傳 list of lists (如果 n>1)，或是 list of strings
-    # 這裡做個簡單處理確保格式統一
+    # [Fix 4] 使用 model.generate (配合之前修正的 llm.py)
+    # 這裡 queries 是 list，n=1
+    predictions = model.generate(queries, n=1)
+    
     predictions = [p.strip() for p in predictions]
 
-    # 5. 計算分數 (Exact Match)
-    score_fn = utility.get_multi_answer_em # 沿用你原本的 utility
+    # 計算分數 (Exact Match)
+    # 使用 utility 中的函數 (請確保 utility.py 存在且有此函數，否則需手寫簡單版)
+    try:
+        score_fn = utility.get_multi_answer_em
+    except AttributeError:
+        # Fallback if utility is missing
+        def simple_em(pred, target_list):
+            return 1.0 if pred in target_list else 0.0
+        score_fn = simple_em
     
     all_scores = []
-    for pred, ans in zip(predictions, ground_truths):
-        score = score_fn(pred, ans)
+    for pred, ans_list in zip(predictions, ground_truths):
+        # ans_list 是一個 list (因為 MMLU 答案可能是多個選項寫法，雖然通常是一個)
+        score = score_fn(pred, ans_list)
         all_scores.append(score)
 
-    # 6. 聚合分數
+    # 聚合分數
     # reshape: (num_prompts, num_samples)
-    scores_matrix = np.array(all_scores).reshape(len(prompts), len(sample_indices))
-    mean_scores = np.mean(scores_matrix, axis=1)
+    if len(all_scores) > 0:
+        scores_matrix = np.array(all_scores).reshape(len(prompts), len(sample_indices))
+        mean_scores = np.mean(scores_matrix, axis=1)
+    else:
+        mean_scores = [0.0] * len(prompts)
 
     # 回傳排序結果
     results = list(zip(prompts, mean_scores))

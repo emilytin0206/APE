@@ -1,0 +1,12 @@
+[
+    {
+        "rank": 1,
+        "score": 0.0,
+        "prompt": "It appears that your friend's task was to analyze a legal scenario and determine which option correctly answers the question based on principles of evidence admissibility in court, particularly focusing on attorney-client privilege."
+    },
+    {
+        "rank": 2,
+        "score": 0.0,
+        "prompt": "Based on the given input-output pairs and the context provided, it seems that the instruction was likely about determining the admissibility of evidence in legal proceedings, specifically focusing on attorney-client privilege. The correct answer provided (C) indicates that statements made by a client during consultations with an attorney are generally protected under attorney-client privilege and therefore inadmissible as testimony if they were not obtained through proper legal channels or waived by the involved parties."
+    }
+]

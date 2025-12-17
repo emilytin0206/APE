@@ -1,66 +1,89 @@
 import ollama
+import datetime
+import os
 from abc import ABC, abstractmethod
 
+# 嘗試引用進度條，如果沒有安裝則使用 dummy 函數
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
 
 class LLM(ABC):
     @abstractmethod
-    def generate_text(self, prompt, n):
+    def generate(self, prompt, n):
         pass
-
 
 class Ollama_Forward(LLM):
     """
-    Wrapper for Ollama (Local LLM).
+    Wrapper for Ollama (Local LLM) with Logging and Progress Bar.
     """
     def __init__(self, config):
         self.config = config
+        # 初始化 Client
+        host = self.config.get('api_url')
+        self.client = ollama.Client(host=host) if host else ollama
         
-    def generate_text(self, prompt, n=1):
+        # 設定 Log 檔案名稱 (例如: ollama_history.log)
+        self.log_file = "ollama_history.log"
+        # 啟動時先在 Log 寫一行分隔線，標記新的一次執行
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*20} New Session Started at {datetime.datetime.now()} {'='*20}\n")
+        
+    def generate(self, prompt, n=1):
         """
         prompt: 可以是單一字串或字串 list
-        n: 每個 prompt 生成幾個回答 (Ollama 通常一次一個，這裡用迴圈模擬)
+        n: 每個 prompt 生成幾個回答
         """
         if not isinstance(prompt, list):
             prompt = [prompt]
             
-        # 讀取參數，如果沒有設定就用預設值
-        ollama_config = self.config.get('ollama_config', {})
-        model_name = ollama_config.get('model', 'llama3') # 預設用 llama3
+        model_name = self.config.get('model', 'llama3')
+        
         options = {
-            'temperature': ollama_config.get('temperature', 0.7),
-            'top_p': ollama_config.get('top_p', 0.9),
-            # 你可以在這裡加入更多 Ollama 支援的參數
+            'temperature': self.config.get('temperature', 0.7),
+            'top_p': self.config.get('top_p', 0.9),
         }
 
         results = []
-        print(f"[Ollama] Generating {len(prompt) * n} completions using {model_name}...")
+        total_tasks = len(prompt) * n
+        print(f"[Ollama] Generating {total_tasks} completions using {model_name}...")
+        print(f"[Log] 詳細輸出將記錄於: {os.path.abspath(self.log_file)}")
         
-        for p in prompt:
+        # 使用 tqdm 顯示進度條
+        for p in tqdm(prompt, desc="Gen Progress"):
             for _ in range(n):
                 try:
-                    response = ollama.generate(
+                    # 發送請求
+                    response = self.client.generate(
                         model=model_name, 
                         prompt=p, 
                         options=options
                     )
-                    results.append(response['response'])
+                    res_content = response['response']
+                    results.append(res_content)
+                    
+                    # === [新增功能] 寫入 Log ===
+                    with open(self.log_file, "a", encoding="utf-8") as f:
+                        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                        f.write(f"[{timestamp}] PROMPT (len={len(p)}):\n{p[:3000]}...\n") # 只印前200字避免太長
+                        f.write(f"[{timestamp}] RESPONSE:\n{res_content}\n")
+                        f.write("-" * 40 + "\n")
+                    # ===========================
+
                 except Exception as e:
-                    print(f"Ollama Error: {e}")
-                    results.append("") # 錯誤時回傳空字串避免崩潰
+                    error_msg = f"Ollama Error: {e}"
+                    print(error_msg)
+                    results.append("")
+                    
+                    # 記錄錯誤到 Log
+                    with open(self.log_file, "a", encoding="utf-8") as f:
+                        f.write(f"[ERROR] {error_msg}\n")
                     
         return results
 
 def model_from_config(config):
-    model_type = config["name"]
-    
-    if model_type == "GPT_forward":
-        return GPT_Forward(config)
-    elif model_type == "GPT_insert":
-        return GPT_Insert(config)
-    # === 新增這一行 ===
-    elif model_type == "Ollama_Forward":
+    model_type = config.get("name")
+    if model_type == "Ollama_Forward":
         return Ollama_Forward(config)
-    # =================
-    
-    raise ValueError(f"Unknown model type: {model_type}")
-
+    return None

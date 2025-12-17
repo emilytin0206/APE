@@ -1,0 +1,12 @@
+[
+    {
+        "rank": 1,
+        "score": 0.0,
+        "prompt": "[Select the correct option based on legal principles regarding attorney-client privilege and admissibility of evidence in a negligence lawsuit.]"
+    },
+    {
+        "rank": 2,
+        "score": 0.0,
+        "prompt": "Identify whether the testimony is admissible or inadmissible based on legal privileges and exceptions, choosing from the given options."
+    }
+]

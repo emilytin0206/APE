@@ -1,0 +1,7 @@
+Experiment: qwen2.5-32b_qwen2.5-32b_merged_5_subsets_20251217_171801
+Task: merged_5_subsets
+Best Score: 0.0
+--------------------------------------------------
+Best Prompt:
+Determine the admissibility of testimony based on legal privileges and exceptions, select the correct option given the scenario, considering factors such as attorney-client privilege, presence of third parties, and purpose of communication.
+--------------------------------------------------
