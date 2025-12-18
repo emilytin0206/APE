@@ -1,6 +1,7 @@
 import ollama
 import datetime
 import os
+import threading
 from abc import ABC, abstractmethod
 
 # 嘗試引用進度條，如果沒有安裝則使用 dummy 函數
@@ -16,7 +17,7 @@ class LLM(ABC):
 
 class Ollama_Forward(LLM):
     """
-    Wrapper for Ollama (Local LLM) with Logging and Progress Bar.
+    Wrapper for Ollama (Local LLM) with Logging, Progress Bar, and Token Counting.
     """
     def __init__(self, config):
         self.config = config
@@ -24,8 +25,19 @@ class Ollama_Forward(LLM):
         host = self.config.get('api_url')
         self.client = ollama.Client(host=host) if host else ollama
         
-        # 設定 Log 檔案名稱 (例如: ollama_history.log)
+        # 設定 Log 檔案名稱
         self.log_file = "ollama_history.log"
+        
+        # === [新增] Token 計數器與鎖 ===
+        self._usage_lock = threading.Lock()
+        self.usage_stats = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "total_calls": 0
+        }
+        # ===============================
+
         # 啟動時先在 Log 寫一行分隔線，標記新的一次執行
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} New Session Started at {datetime.datetime.now()} {'='*20}\n")
@@ -47,11 +59,15 @@ class Ollama_Forward(LLM):
 
         results = []
         total_tasks = len(prompt) * n
-        print(f"[Ollama] Generating {total_tasks} completions using {model_name}...")
-        print(f"[Log] 詳細輸出將記錄於: {os.path.abspath(self.log_file)}")
         
-        # 使用 tqdm 顯示進度條
-        for p in tqdm(prompt, desc="Gen Progress"):
+        # 為了避免 log 太亂，只有當 prompt 數量大於 1 時才印進度條 (Evaluator 內部並發呼叫時通常是一次一個)
+        iterator = prompt
+        if len(prompt) > 1:
+            print(f"[Ollama] Generating {total_tasks} completions using {model_name}...")
+            print(f"[Log] 詳細輸出將記錄於: {os.path.abspath(self.log_file)}")
+            iterator = tqdm(prompt, desc="Gen Progress")
+        
+        for p in iterator:
             for _ in range(n):
                 try:
                     # 發送請求
@@ -63,13 +79,24 @@ class Ollama_Forward(LLM):
                     res_content = response['response']
                     results.append(res_content)
                     
-                    # === [新增功能] 寫入 Log ===
+                    # === [新增] 抓取 Token 使用量並更新 ===
+                    # Ollama API 回傳欄位: prompt_eval_count (Input), eval_count (Output)
+                    p_tokens = response.get('prompt_eval_count', 0)
+                    c_tokens = response.get('eval_count', 0)
+                    
+                    with self._usage_lock:
+                        self.usage_stats['prompt_tokens'] += p_tokens
+                        self.usage_stats['completion_tokens'] += c_tokens
+                        self.usage_stats['total_tokens'] += (p_tokens + c_tokens)
+                        self.usage_stats['total_calls'] += 1
+                    # ======================================
+
+                    # === 寫入 Log ===
                     with open(self.log_file, "a", encoding="utf-8") as f:
                         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                        f.write(f"[{timestamp}] PROMPT (len={len(p)}):\n{p[:3000]}...\n") # 只印前200字避免太長
+                        f.write(f"[{timestamp}] PROMPT (len={len(p)}) [Tokens: {p_tokens}+{c_tokens}]:\n{p[:200]}...\n") 
                         f.write(f"[{timestamp}] RESPONSE:\n{res_content}\n")
                         f.write("-" * 40 + "\n")
-                    # ===========================
 
                 except Exception as e:
                     error_msg = f"Ollama Error: {e}"
@@ -81,6 +108,11 @@ class Ollama_Forward(LLM):
                         f.write(f"[ERROR] {error_msg}\n")
                     
         return results
+
+    def get_usage(self):
+        """回傳目前的 Token 使用統計 (Thread-safe)"""
+        with self._usage_lock:
+            return self.usage_stats.copy()
 
 def model_from_config(config):
     model_type = config.get("name")

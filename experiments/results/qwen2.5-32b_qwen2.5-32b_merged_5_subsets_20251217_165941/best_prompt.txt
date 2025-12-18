@@ -1,7 +1,0 @@
-Experiment: qwen2.5-32b_qwen2.5-32b_merged_5_subsets_20251217_165941
-Task: merged_5_subsets
-Best Score: 0.0
---------------------------------------------------
-Best Prompt:
-determine the admissibility of testimony based on legal principles related to attorney-client privilege.
---------------------------------------------------

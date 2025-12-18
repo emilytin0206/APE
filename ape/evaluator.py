@@ -2,9 +2,14 @@
 import random
 import numpy as np
 from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
+
 from . import utility 
 
-# [Fix 1] 修改函式簽章，接收 model 並移除不需要的 template 物件參數
 def exec_accuracy_evaluator(
     model, 
     prompts: List[str],
@@ -13,99 +18,103 @@ def exec_accuracy_evaluator(
     config: Dict[str, Any]
 ) -> List[Tuple[str, float]]:
     """
-    Evaluates prompts using Execution Accuracy (Exact Match).
-    Adaptation: Accepts model instance directly and handles string templates.
+    使用並發 (Threading) 加速的評估器
     """
     
-    # 讀取參數
+    # --- 1. 設定參數 ---
     num_samples = config.get('num_samples', 20)
     num_few_shot = config.get('num_few_shot', 0)
     
-    # [Fix 2] 直接從 config 讀取字串模板 (配合 main.py 的設定)
+    # 根據 dataset 名稱決定 task_type (用於 utility 解析)
+    # 若 config 沒寫，預設 'general'
+    task_name = config.get('task_name', 'general').lower()
+    if 'gsm8k' in task_name:
+        task_type = 'gsm8k'
+    elif any(x in task_name for x in ['boolean', 'causal']):
+        task_type = 'boolean'
+    else:
+        task_type = 'general'
+
     eval_template = config.get('eval_template', "Instruction: [PROMPT]\n\n[INPUT]\n[OUTPUT]")
     demos_template = config.get('demos_template', "Input: [INPUT]\nOutput: [OUTPUT]")
     
-    # 準備數據採樣 (Subsampling)
     inputs, outputs = eval_data
     indices = list(range(len(inputs)))
-    # 確保不會 index out of range
     sample_indices = indices[:min(num_samples, len(indices))]
     
-    queries = []
-    ground_truths = []
-    
-    print(f"Generating queries for {len(prompts)} prompts over {len(sample_indices)} samples...")
+    print(f"Evaluating {len(prompts)} prompts on {len(sample_indices)} samples (Task Type: {task_type})...")
 
-    # 構建查詢
+    # --- 2. 內部函數：單一請求處理 ---
+    def process_single_request(prompt_str, input_str, ground_truth_list):
+        # 準備 Few-shot (如果需要)
+        full_demo = ""
+        if num_few_shot > 0 and few_shot_data:
+            # 隨機採樣 few-shot (注意：這裡為了效率可能要考慮是否每次隨機，或是固定)
+            # 為了簡單起見，這裡每次請求都隨機採樣
+            fs_indices = random.sample(range(len(few_shot_data[0])), min(num_few_shot, len(few_shot_data[0])))
+            demo_strs = []
+            for i in fs_indices:
+                d = demos_template.replace('[INPUT]', few_shot_data[0][i])\
+                                  .replace('[OUTPUT]', few_shot_data[1][i][0])
+                demo_strs.append(d)
+            full_demo = "\n\n".join(demo_strs)
+
+        # 組合 Query
+        query = eval_template.replace('[PROMPT]', prompt_str)\
+                             .replace('[INPUT]', input_str)\
+                             .replace('[OUTPUT]', "")
+        
+        if full_demo:
+            query = f"{full_demo}\n\n{query}"
+            
+        # 呼叫模型 (注意：這裡假設 model.generate 支援單字串輸入)
+        # 我們將 n=1, 並且只取第一個結果
+        try:
+            preds = model.generate(query, n=1)
+            pred = preds[0] if preds else ""
+            
+            # 計算分數
+            score = utility.get_multi_answer_em(pred, ground_truth_list, task_type=task_type)
+            return score
+        except Exception as e:
+            print(f"Error in eval: {e}")
+            return 0.0
+
+    # --- 3. 主迴圈：並發執行 ---
+    prompt_scores = []
+    
+    # 我們需要評估 每個 Prompt x 每個 Sample
+    # 為了進度條好看，我們對每個 Prompt 進行一次並發批次
+    
+    # 設定並發數量 (根據您的顯存/API限制調整，Ollama 本地通常 4-8)
+    MAX_WORKERS = 8 
+
     for prompt in prompts:
-        for idx in sample_indices:
-            inp = inputs[idx]
-            out = outputs[idx] # 這是標準答案 list
+        scores = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_idx = {}
+            for idx in sample_indices:
+                inp = inputs[idx]
+                out = outputs[idx]
+                future = executor.submit(process_single_request, prompt, inp, out)
+                future_to_idx[future] = idx
             
-            # 準備 Few-shot 範例
-            full_demo = ""
-            if num_few_shot > 0 and few_shot_data:
-                # 隨機抽取 demo
-                fs_indices = random.sample(range(len(few_shot_data[0])), min(num_few_shot, len(few_shot_data[0])))
+            # 等待當前 Prompt 的所有測試完成
+            # 使用 tqdm 顯示進度 (如果 sample 數多才有感)
+            iterator = as_completed(future_to_idx)
+            if len(sample_indices) > 10:
+                iterator = tqdm(iterator, total=len(sample_indices), desc="Scoring", leave=False)
                 
-                demo_strs = []
-                for i in fs_indices:
-                    # [Fix 3] 使用 replace 處理字串模板
-                    d = demos_template.replace('[INPUT]', few_shot_data[0][i])\
-                                      .replace('[OUTPUT]', few_shot_data[1][i][0])
-                    demo_strs.append(d)
-                full_demo = "\n\n".join(demo_strs)
+            for future in iterator:
+                scores.append(future.result())
 
-            # [Fix 3] 使用 replace 處理 Eval 模板
-            # 邏輯：先把 prompt 放進去，再放 demo，最後放 input
-            # 注意：這裡的 replace 順序需依照您的模板結構微調，這裡假設標準 APE 格式
-            query = eval_template.replace('[PROMPT]', prompt)\
-                                 .replace('[INPUT]', inp)\
-                                 .replace('[OUTPUT]', "") # 留空給模型填
-            
-            # 如果有 demo，通常 eval_template 裡沒有 [full_demo] 佔位符
-            # 這裡簡單地將 demo 接在 query 前面 (若模板沒特殊設計)
-            if full_demo:
-                query = f"{full_demo}\n\n{query}"
-            
-            queries.append(query)
-            ground_truths.append(out)
+        avg_score = np.mean(scores) if scores else 0.0
+        prompt_scores.append((prompt, avg_score))
+        
+        # 簡單印出當前 Prompt 的表現
+        print(f"  > Prompt: {prompt[:50]}... | Score: {avg_score:.2f}")
 
-    # 執行生成 (Batch Generation)
-    print(f"Querying LLM (Total {len(queries)} requests)...")
+    # 排序
+    prompt_scores.sort(key=lambda x: x[1], reverse=True)
     
-    # [Fix 4] 使用 model.generate (配合之前修正的 llm.py)
-    # 這裡 queries 是 list，n=1
-    predictions = model.generate(queries, n=1)
-    
-    predictions = [p.strip() for p in predictions]
-
-    # 計算分數 (Exact Match)
-    # 使用 utility 中的函數 (請確保 utility.py 存在且有此函數，否則需手寫簡單版)
-    try:
-        score_fn = utility.get_multi_answer_em
-    except AttributeError:
-        # Fallback if utility is missing
-        def simple_em(pred, target_list):
-            return 1.0 if pred in target_list else 0.0
-        score_fn = simple_em
-    
-    all_scores = []
-    for pred, ans_list in zip(predictions, ground_truths):
-        # ans_list 是一個 list (因為 MMLU 答案可能是多個選項寫法，雖然通常是一個)
-        score = score_fn(pred, ans_list)
-        all_scores.append(score)
-
-    # 聚合分數
-    # reshape: (num_prompts, num_samples)
-    if len(all_scores) > 0:
-        scores_matrix = np.array(all_scores).reshape(len(prompts), len(sample_indices))
-        mean_scores = np.mean(scores_matrix, axis=1)
-    else:
-        mean_scores = [0.0] * len(prompts)
-
-    # 回傳排序結果
-    results = list(zip(prompts, mean_scores))
-    results.sort(key=lambda x: x[1], reverse=True)
-    
-    return results
+    return prompt_scores

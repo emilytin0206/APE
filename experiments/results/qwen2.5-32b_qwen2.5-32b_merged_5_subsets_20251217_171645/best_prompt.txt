@@ -1,7 +1,0 @@
-Experiment: qwen2.5-32b_qwen2.5-32b_merged_5_subsets_20251217_171645
-Task: merged_5_subsets
-Best Score: 0.0
---------------------------------------------------
-Best Prompt:
-[Select the correct option based on legal principles regarding attorney-client privilege and admissibility of evidence in a negligence lawsuit.]
---------------------------------------------------
